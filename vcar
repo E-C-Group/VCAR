@@ -1,0 +1,183 @@
+#!/bin/sh -
+##
+## SIP Call Anomaly Analyzer  0.2
+## lindsey@e-c-group.com / +1-229-316-0013
+## ECG, Inc.  Thu Feb 24 15:17:07 EST 2011
+##
+
+die() {
+  echo "DYING: $1" 1>&2
+  exit 255
+}
+
+## Verify we have the right tools
+if ! tshark -version >/dev/null
+then
+  die "Cannot find 'tshark'; install it and ensure it's in the PATH"
+fi
+
+
+if ! awk 'BEGIN {exit}' >/dev/null
+then
+  die "Cannot find 'awk'; install it and ensure it's in the PATH"
+fi
+
+if [ "$1" = "--help" ] || [ -z "$1" ]; then
+  cat << vEOF
+$0 [--debug] [--stats] SIP_PACKET_CAPTURE_FILENAME
+
+VoIP Call Anomaly Reporter: Reports anomalies detected in SIP calls
+in the provided file named SIP_PACKET_CAPTURE_FILENAME. File should
+be sorted chronologically.
+
+Detects:
+ (a) Changes in media IP address or port.
+ (b) SIP failures that occur after a SIP non-100 provisional response.
+
+
+Options:
+  --debug    Show packet-by-packet debugging info.
+  --stats    Show final statistics after processing the entire file.
+
+Version 0.1, Thu Feb 24 15:16:31 EST 2011, lindsey@e-c-group.com; Copyright (C) 2011 ECG Inc.
+vEOF
+
+  exit 254
+
+fi
+
+
+while [ "$1" ]; do
+  case "$1" in
+    "--debug") awk_fields="$awk_fields -v DEBUG=1" ; shift ;;
+    "--stats") awk_fields="$awk_fields -v STATS=1" ; shift ;;
+    *) filename="$1" ; shift ;;
+  esac
+done
+
+tshark -r $filename -Tfields -e frame.number -e frame.time -e frame.time_epoch -e sip.Call-ID -e sip.Request-Line -e sip.Status-Code -e sdp.connection_info.address -e sdp.media.port  -e sip.From -e ip.src -e ip.dst |
+awk -v FS='\t' $awk_fields '
+
+function debugprint(a) {
+  if (DEBUG) print a
+}
+
+{
+
+  frame_number=$1
+  frame_time=$2
+  frame_time_epoch=$3
+  sip_call_id=$4
+  sip_request_line=$5
+  sip_status_code=$6
+  sdp_connection_info_address=$7
+  sdp_media_port=$8
+  sip_from=$9
+  ip_src=$10
+  ip_dst=$11
+
+  debugprint($0)
+  debugprint("sip status code " sip_status_code)
+  debugprint("frame time epoch" frame_time_epoch)
+
+  aggregate_sip_call_id=sip_call_id "/" sip_from
+
+  ## Verify that the file is sorted
+  if ((frame_time_epoch < max_observed_frame_time_epoch) && (! exception_occurred[file_not_sorted])) {
+    print "file-not-sorted-exception: Frames in the file are not sorted. Your results will likely be incorrect."
+    exception_occurred[file_not_sorted]=1;
+  } else {
+    max_observed_frame_time_epoch=frame_time_epoch;
+  }
+
+  ## First time we have heard of this call?  Keep track of that.
+  if ((! first_reference_to_call_time[aggregate_sip_call_id]) || (frame_time_epoch < first_reference_to_call_time[aggregate_sip_call_id])) {
+    first_reference_to_call_time[aggregate_sip_call_id]=frame_time_epoch;
+    first_reference_to_call_frame_number[aggregate_sip_call_id]=frame_number;
+
+    debugprint("Setting first refrence to call " aggregate_sip_call_id " to " first_reference_to_call_time[aggregate_sip_call_id]);
+  }
+
+  ## Record when non-100 provisional responses are received
+  non_100_provisional_response=((sip_status_code > 100) && (sip_status_code < 200));
+  if (non_100_provisional_response) {
+    non_100_provisional_response_time[aggregate_sip_call_id]=frame_time_epoch;
+    debugprint("Found a non-100 provisional response for " aggregate_sip_call_id " at time " frame_time_epoch)
+  }
+
+
+  ## Record when a SIP failure occurs and warn if that occurs after a non-100 provisional response
+  sip_failure_response=(sip_status_code >= 400);
+  if (sip_failure_response) {
+    debugprint("Found a sip failure response for " aggregate_sip_call_id " at time " frame_time_epoch)
+
+    if ((non_100_provisional_response_time[aggregate_sip_call_id]) &&
+        (non_100_provisional_response_time[aggregate_sip_call_id] < frame_time_epoch) &&
+        (sip_status_code != 487)) {
+      ## we do not care about 487s, because they meant the call was abandoned with CANCEL
+
+      print "failure-after-progress: Call-ID " sip_call_id " started in frame " first_reference_to_call_frame_number[aggregate_sip_call_id] " failed with " sip_status_code " at time " frame_time " in frame " frame_number "  but had an earlier call-progress indicator"
+
+      anomaly_failure_after_progress[aggregate_sip_call_id]=1;
+    }
+  }
+
+  ## Record when SIP media parameters are received, and warn if the media provided by an endpoint for a call changes
+  if (sdp_connection_info_address && sdp_media_port) {
+    sdp_connection_info=sdp_connection_info_address ":" sdp_media_port
+
+    previous_sdp_connection_info=sdp_connection_info_from_src_to_dst[aggregate_sip_call_id "/" ip_src "/" ip_dst ];
+
+    debugprint("Connection info from " ip_src " related to call id " aggregate_sip_call_id " has been provided: " sdp_connection_info)
+
+    if ((previous_sdp_connection_info) && (previous_sdp_connection_info != sdp_connection_info)) {
+      print "sdp-connection-info-change : Call-ID " sip_call_id " sent from " ip_src " to " ip_dst " changed SDP from " previous_sdp_connection_info " to " sdp_connection_info
+      anomaly_sdp_connection_info_change[aggregate_sip_call_id]=1;
+    }
+
+    sdp_connection_info_from_src_to_dst[aggregate_sip_call_id "/" ip_src "/" ip_dst ] = sdp_connection_info;
+
+
+  }
+}
+
+END {
+  if (STATS) {
+    print ""
+    print "Stats: "
+
+    for (i in first_reference_to_call_time) {
+      debugprint("considering call " i);
+      call_count++;
+
+      debugprint("first reference to call time: " first_reference_to_call_time[i]);
+
+      if ((!earliest_call_start_time) || (first_reference_to_call_time[i] < earliest_call_start_time)) {
+        earliest_call_start_time=first_reference_to_call_time[i];
+        debugprint("earliest_call_start_time set to " earliest_call_start_time);
+      }
+
+      if ((!latest_call_start_time) || (first_reference_to_call_time[i] > latest_call_start_time)) {
+        latest_call_start_time=first_reference_to_call_time[i];
+        debugprint("latest_call_start_time set to " latest_call_start_time);
+      }
+    }
+
+    print call_count " distinct call-legs observed (as counted by unique Call-ID plus From header combinations)"
+
+    print latest_call_start_time - earliest_call_start_time " seconds between earliest call start and latest call start";
+
+    for (aggregate_call_id in anomaly_sdp_connection_info_change) {
+      ascic++;
+    }
+    print ascic " call-legs have SDP connection info change; " ascic / call_count "%"
+
+    for (aggregate_call_id in anomaly_failure_after_progress) {
+      afap++;
+    }
+    print afap " call-legs have Failure after progress; " afap / call_count "%"
+
+  }
+}
+
+'
